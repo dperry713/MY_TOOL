@@ -1,0 +1,7 @@
+PyQt6
+pyqtgraph
+reportlab
+pywin32
+numpy
+obd
+pandas
