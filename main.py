@@ -9,16 +9,18 @@ from serial.tools.list_ports import comports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGridLayout,
-    QLineEdit, QMessageBox, QStatusBar, QFileDialog, QScrollArea
+    QLineEdit, QMessageBox, QStatusBar, QFileDialog, QScrollArea, QFrame,
+    QGraphicsDropShadowEffect, QMenu
 )
-from PyQt6.QtCore import QTimer, Qt, QRect, QPoint
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPalette, QLinearGradient
+from PyQt6.QtCore import QTimer, Qt, QRect, QPoint, QSize, QPointF
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPalette, QLinearGradient, QIcon, QPixmap, QImage, QAction
 
 import pyqtgraph as pg
 import obd
 import threading
 import traceback
 import logging
+from enhanced_gauge import CircularGauge
 
 # Logging
 LOG_FILE = "my_tool_debug.log"
@@ -42,67 +44,58 @@ RECONNECT_INTERVAL_MS = 5000  # Try reconnect every 5 seconds if disconnected
 RPM_BINS = list(range(400, 8001, 400))  # 400,800,...,8000 len=20
 MAP_BINS = list(range(20, 106, 5))  # 20,25,...,105 len=18
 
-class CircularGauge(QWidget):
-    def __init__(self, min_value=0, max_value=100, parent=None):
-        super().__init__(parent)
-        self.min_value = min_value
-        self.max_value = max_value
-        self.current_value = min_value
-        self.start_angle = 225  # Starting angle in degrees
-        self.span_angle = 270   # Span in degrees
-        self.setMinimumSize(200, 200)
+# Theme / style (modern dark card style)
+THEME_QSS = """
+QWidget {
+    background-color: #141416;
+    color: #E6E6E6;
+    font-family: Segoe UI, Arial, sans-serif;
+    font-size: 11pt;
+}
+.card {
+    background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 #1b1b1e, stop:1 #111113);
+    border: 1px solid #2b2b2f;
+    border-radius: 10px;
+    padding: 10px;
+}
+QLabel.title {
+    font-weight: 600;
+    font-size: 12pt;
+    color: #FFFFFF;
+}
+QPushButton {
+    background-color: #2a7bd6;
+    color: white;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+QPushButton:disabled { background-color: #3a3a3d; color: #888888 }
+QTableWidget {
+    background-color: transparent;
+    gridline-color: #2b2b2f;
+}
+QHeaderView::section { background-color: #171718; color: #dcdcdc; border: none }
+QWidget[class="card"] {
+    background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 #1b1b1e, stop:1 #111113);
+    border: 1px solid #2b2b2f;
+    border-radius: 10px;
+    padding: 8px;
+}
+QTabWidget::pane { border: none }
+QTabBar::tab { background: #151516; padding: 8px; border-top-left-radius: 6px; border-top-right-radius: 6px }
+QTabBar::tab:selected { background: #1e73d1 }
+"""
 
-    def set_value(self, value):
-        if self.min_value <= value <= self.max_value:
-            self.current_value = value
-            self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        side = min(self.width(), self.height())
-        outer_rect = QRect(10, 10, side - 20, side - 20)
-        center = outer_rect.center()
-
-        # Background circle with gradient
-        gradient = QLinearGradient(0, 0, 0, side)
-        gradient.setColorAt(0, QColor(60, 60, 60))
-        gradient.setColorAt(1, QColor(30, 30, 30))
-        painter.setBrush(QBrush(gradient))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(outer_rect)
-
-        # Background arc
-        pen = QPen(QColor(80, 80, 80), 20, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        painter.drawArc(outer_rect, self.start_angle * 16, -self.span_angle * 16)  # Negative for clockwise
-
-        # Progress arc with gradient color
-        progress = (self.current_value - self.min_value) / (self.max_value - self.min_value)
-        angle = self.span_angle * progress
-        color_start = QColor(0, 200, 0)
-        color_end = QColor(255, 50, 0)
-        gradient = QLinearGradient(center.x() - side/2, center.y() - side/2, center.x() + side/2, center.y() + side/2)
-        gradient.setColorAt(0, color_start)
-        gradient.setColorAt(1, color_end if progress > 0.8 else color_start)
-        pen = QPen(QBrush(gradient), 20, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        painter.drawArc(outer_rect, self.start_angle * 16, -int(angle * 16))
-
-        # Needle with shadow
-        needle_angle = self.start_angle - angle
-        needle_length = (side / 2) - 40
-        dx = math.cos(math.radians(needle_angle)) * needle_length
-        dy = -math.sin(math.radians(needle_angle)) * needle_length
-        pen = QPen(QColor(255, 255, 255), 5, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        painter.drawLine(center, QPoint(int(center.x() + dx), int(center.y() + dy)))
-
-        # Value text with modern font
-        painter.setPen(QColor(220, 220, 220))
-        font = QFont("Segoe UI", 20, QFont.Weight.Bold)
-        painter.setFont(font)
-        painter.drawText(outer_rect, Qt.AlignmentFlag.AlignCenter, f"{int(self.current_value)}")
+def create_textured_background(width, height, pattern_size=4):
+    """Generate a subtle carbon-fiber-like texture."""
+    pix = QPixmap(pattern_size * 2, pattern_size * 2)
+    pix.fill(QColor(15, 15, 15))
+    painter = QPainter(pix)
+    painter.setPen(QColor(25, 25, 25))
+    painter.drawLine(0, 0, pattern_size, pattern_size)
+    painter.drawLine(pattern_size, 0, 0, pattern_size)
+    painter.end()
+    return pix
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -114,8 +107,7 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Disconnected - Select device and connect")
-
-        # OBD connection
+        
         self.connection = None
         self.async_connection = None
         self.supported_commands = []
@@ -198,109 +190,227 @@ class MainWindow(QMainWindow):
         """)
         main_layout.addWidget(self.tabs)
 
-        # Dashboard Tab with scroll for more labels
+        # Dashboard Tab - Professional OBD dash.pro style
         dashboard_tab = QWidget()
-        dashboard_scroll = QScrollArea()
-        dashboard_scroll.setWidgetResizable(True)
-        dashboard_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        dashboard_content = QWidget()
-        dashboard_layout = QGridLayout(dashboard_content)
-        dashboard_content.setStyleSheet("background: transparent;")
+        
+        # Set dark textured background for dashboard
+        try:
+            textured_bg = self.create_dashboard_textured_background(size=(1400, 900), pattern_intensity=0.1)
+            palette = QPalette()
+            palette.setBrush(QPalette.ColorRole.Window, QBrush(textured_bg))
+            dashboard_tab.setPalette(palette)
+            dashboard_tab.setAutoFillBackground(True)
+        except Exception as e:
+            logger.warning(f"Failed to set textured background: {e}")
+            dashboard_tab.setStyleSheet("background-color: #0f0f10;")
+        
+        dashboard_main_layout = QVBoxLayout(dashboard_tab)
+        dashboard_main_layout.setContentsMargins(8, 8, 8, 8)
+        dashboard_main_layout.setSpacing(0)
 
-        # Gauges
-        self.rpm_gauge = CircularGauge(0, 8000)
+        # Central gauge area with big RPM and small surrounding gauges
+        gauge_widget = QWidget()
+        gauge_widget.setStyleSheet("background-color: transparent;")
+        gauge_layout = QGridLayout(gauge_widget)
+        gauge_layout.setContentsMargins(0, 0, 0, 0)
+        gauge_layout.setSpacing(10)
+
+        # Create big central RPM gauge
+        self.rpm_gauge = CircularGauge(0, 8000, title="ENG rpm.", yellow_threshold=0.7, red_threshold=0.9)
         self.rpm_label = QLabel("RPM: --")
-        self.rpm_label.setStyleSheet("color: #ddd; font: bold 14px 'Segoe UI';")
-        self.speed_gauge = CircularGauge(0, 200)
+        self.rpm_label.setStyleSheet("color: #ddd; font: bold 12px 'Segoe UI';")
+
+        # Create small compact gauges for peripheral sensors
+        self.speed_gauge = CircularGauge(0, 200, compact=True, title="Speed")
         self.speed_label = QLabel("Speed: -- km/h")
-        self.speed_label.setStyleSheet("color: #ddd; font: bold 14px 'Segoe UI';")
+        self.speed_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
 
-        # Other labels with modern styling
+        # Compact gauges for other sensors (arranged around center)
+        self.iat_gauge = CircularGauge(0, 100, compact=True, title="Intake Air")
+        self.coolant_gauge = CircularGauge(-40, 220, compact=True, title="Coolant")
+        self.throttle_gauge = CircularGauge(0, 100, compact=True, title="Throttle_abs")
+        self.map_gauge = CircularGauge(0, 250, compact=True, title="MAP")
+        self.load_gauge = CircularGauge(0, 100, compact=True, title="LOAD(cal)")
+
+        # Layout: center big RPM in middle, small gauges around
+        # Top row: Fuel sys, Spark Adv, RPM, Intake Air, Load
+        # Middle row: MAP, Coolant, Speed, Throttle, O2_B1S1
+        gauge_layout.addWidget(self.rpm_gauge, 1, 1, 2, 2)  # Big gauge in center, spans 2x2
+
+        # Top left
+        self.fuel_sys_gauge = CircularGauge(0, 1, compact=True, title="Fuel sys.")
+        gauge_layout.addWidget(self.fuel_sys_gauge, 0, 0)
+        
+        # Top center-left
+        self.spark_adv_gauge = CircularGauge(-20, 65, compact=True, title="Spark Adv")
+        gauge_layout.addWidget(self.spark_adv_gauge, 0, 1)
+        
+        # Top right
+        self.iat_gauge2 = CircularGauge(-40, 215, compact=True, title="Intake Air")
+        gauge_layout.addWidget(self.iat_gauge2, 0, 3)
+        
+        # Middle left
+        self.map_gauge2 = CircularGauge(0, 250, compact=True, title="MAP")
+        gauge_layout.addWidget(self.map_gauge2, 1, 0)
+        
+        # Middle right
+        self.throttle_gauge2 = CircularGauge(0, 100, compact=True, title="Throttle_abs")
+        gauge_layout.addWidget(self.throttle_gauge2, 1, 3)
+        
+        # Bottom left
+        self.coolant_gauge2 = CircularGauge(-40, 220, compact=True, title="Coolant")
+        gauge_layout.addWidget(self.coolant_gauge2, 2, 0)
+        
+        # Bottom center-left
+        self.load_gauge2 = CircularGauge(0, 100, compact=True, title="LOAD(cal)")
+        gauge_layout.addWidget(self.load_gauge2, 2, 2)
+        
+        # Bottom right
+        self.o2_b1s1_gauge = CircularGauge(0, 1, compact=True, title="O2_B1S1")
+        gauge_layout.addWidget(self.o2_b1s1_gauge, 2, 3)
+
+        # Other sensor labels (placed in a side panel for reference)
+        labels_panel = QFrame()
+        labels_panel.setProperty('class', 'card')
+        labels_layout = QVBoxLayout(labels_panel)
+        labels_layout.setContentsMargins(6, 6, 6, 6)
+        labels_layout.setSpacing(4)
+
         self.map_label = QLabel("MAP: -- kPa")
-        self.map_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.map_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.maf_label = QLabel("MAF: -- g/s")
-        self.maf_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.maf_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.iat_label = QLabel("IAT: -- °C")
-        self.iat_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.iat_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.coolant_label = QLabel("Coolant: -- °C")
-        self.coolant_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.coolant_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.throttle_label = QLabel("Throttle: -- %")
-        self.throttle_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.throttle_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.ve_label = QLabel("VE: -- g*K/kPa")
-        self.ve_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.ve_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.timing_label = QLabel("Ignition Timing: -- °")
-        self.timing_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.timing_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.o2_b1s1_label = QLabel("O2 B1S1: -- V")
-        self.o2_b1s1_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.o2_b1s1_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.o2_b1s2_label = QLabel("O2 B1S2: -- V")
-        self.o2_b1s2_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.o2_b1s2_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.o2_b2s1_label = QLabel("O2 B2S1: -- V")
-        self.o2_b2s1_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.o2_b2s1_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.o2_b2s2_label = QLabel("O2 B2S2: -- V")
-        self.o2_b2s2_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.o2_b2s2_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.trans_temp_label = QLabel("Trans Temp: -- °C")
-        self.trans_temp_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.trans_temp_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.oil_temp_label = QLabel("Oil Temp: -- °C")
-        self.oil_temp_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.oil_temp_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.oil_pressure_label = QLabel("Oil Pressure: -- psi")
-        self.oil_pressure_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.oil_pressure_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
         self.gear_position_label = QLabel("Gear Position: --")
-        self.gear_position_label.setStyleSheet("color: #ddd; font: 12px 'Segoe UI';")
+        self.gear_position_label.setStyleSheet("color: #ddd; font: 10px 'Segoe UI';")
 
-        # Layout with two columns for gauges and labels
-        dashboard_layout.addWidget(self.rpm_label, 0, 0)
-        dashboard_layout.addWidget(self.rpm_gauge, 0, 1)
-        dashboard_layout.addWidget(self.speed_label, 1, 0)
-        dashboard_layout.addWidget(self.speed_gauge, 1, 1)
-        dashboard_layout.addWidget(self.map_label, 2, 0)
-        dashboard_layout.addWidget(self.maf_label, 3, 0)
-        dashboard_layout.addWidget(self.iat_label, 4, 0)
-        dashboard_layout.addWidget(self.coolant_label, 5, 0)
-        dashboard_layout.addWidget(self.throttle_label, 6, 0)
-        dashboard_layout.addWidget(self.ve_label, 7, 0)
-        dashboard_layout.addWidget(self.timing_label, 8, 0)
-        dashboard_layout.addWidget(self.o2_b1s1_label, 9, 0)
-        dashboard_layout.addWidget(self.o2_b1s2_label, 10, 0)
-        dashboard_layout.addWidget(self.o2_b2s1_label, 11, 0)
-        dashboard_layout.addWidget(self.o2_b2s2_label, 12, 0)
-        dashboard_layout.addWidget(self.trans_temp_label, 13, 0)
-        dashboard_layout.addWidget(self.oil_temp_label, 14, 0)
-        dashboard_layout.addWidget(self.oil_pressure_label, 15, 0)
-        dashboard_layout.addWidget(self.gear_position_label, 16, 0)
-        dashboard_scroll.setWidget(dashboard_content)
-        dashboard_tab.setLayout(QVBoxLayout())
-        dashboard_tab.layout().addWidget(dashboard_scroll)
+        labels_layout.addWidget(self.map_label)
+        labels_layout.addWidget(self.maf_label)
+        labels_layout.addWidget(self.iat_label)
+        labels_layout.addWidget(self.coolant_label)
+        labels_layout.addWidget(self.throttle_label)
+        labels_layout.addWidget(self.ve_label)
+        labels_layout.addWidget(self.timing_label)
+        labels_layout.addWidget(self.o2_b1s1_label)
+        labels_layout.addWidget(self.o2_b1s2_label)
+        labels_layout.addWidget(self.o2_b2s1_label)
+        labels_layout.addWidget(self.o2_b2s2_label)
+        labels_layout.addWidget(self.trans_temp_label)
+        labels_layout.addWidget(self.oil_temp_label)
+        labels_layout.addWidget(self.oil_pressure_label)
+        labels_layout.addWidget(self.gear_position_label)
+        labels_layout.addStretch()
+
+        # Main dashboard layout: gauges on left, labels panel on right
+        dashboard_content_layout = QHBoxLayout()
+        dashboard_content_layout.addWidget(gauge_widget, stretch=3)
+        dashboard_content_layout.addWidget(labels_panel, stretch=1)
+        dashboard_main_layout.addLayout(dashboard_content_layout)
+
+        # Add FAB (Floating Action Button) - positioned at bottom right
+        fab_button = QPushButton("⋮")
+        fab_button.setFixedSize(50, 50)
+        fab_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2a7bd6;
+                color: white;
+                border: none;
+                border-radius: 25px;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #3a8be6; }
+            QPushButton:pressed { background-color: #1a6ac6; }
+        """)
+        fab_button.setToolTip("Quick actions menu")
+        fab_button.clicked.connect(self.show_fab_menu)
+        fab_layout = QHBoxLayout()
+        fab_layout.addStretch()
+        fab_layout.addWidget(fab_button)
+        fab_layout.setContentsMargins(0, 0, 16, 16)
+        dashboard_main_layout.addLayout(fab_layout)
+        self.fab_button = fab_button
+
         self.tabs.addTab(dashboard_tab, "Dashboard")
 
         # Sensors Tab with modern table style
         sensors_tab = QWidget()
         sensors_layout = QVBoxLayout(sensors_tab)
+        # Wrap sensors table in a card
+        sensors_card = QFrame()
+        sensors_card.setProperty('class', 'card')
+        sensors_card_layout = QVBoxLayout(sensors_card)
+        try:
+            s_sh = QGraphicsDropShadowEffect()
+            s_sh.setBlurRadius(10)
+            s_sh.setOffset(0, 2)
+            s_sh.setColor(QColor(0,0,0,150))
+            sensors_card.setGraphicsEffect(s_sh)
+        except Exception:
+            pass
         self.sensors_table = QTableWidget()
         self.sensors_table.setColumnCount(2)
         self.sensors_table.setHorizontalHeaderLabels(["Sensor", "Value"])
         self.sensors_table.setStyleSheet("""
-            QTableWidget { background-color: #333; color: #ddd; gridline-color: #444; }
+            QTableWidget { background-color: transparent; color: #ddd; gridline-color: #444; }
             QHeaderView::section { background-color: #444; color: white; }
         """)
-        sensors_layout.addWidget(self.sensors_table)
+        sensors_card_layout.addWidget(self.sensors_table)
+        sensors_layout.addWidget(sensors_card)
         self.tabs.addTab(sensors_tab, "Sensors")
 
         # VE Table Tab with styled table and heatmap
         ve_tab = QWidget()
         ve_layout = QVBoxLayout(ve_tab)
+        # Wrap VE table and heatmap in a card
+        ve_card = QFrame()
+        ve_card.setProperty('class', 'card')
+        ve_card_layout = QVBoxLayout(ve_card)
+        try:
+            v_sh = QGraphicsDropShadowEffect()
+            v_sh.setBlurRadius(10)
+            v_sh.setOffset(0, 2)
+            v_sh.setColor(QColor(0,0,0,150))
+            ve_card.setGraphicsEffect(v_sh)
+        except Exception:
+            pass
         self.ve_table = QTableWidget(len(MAP_BINS), len(RPM_BINS))
         self.ve_table.setVerticalHeaderLabels([str(m) for m in MAP_BINS])
         self.ve_table.setHorizontalHeaderLabels([str(r) for r in RPM_BINS])
         self.ve_table.setStyleSheet("""
-            QTableWidget { background-color: #333; color: #ddd; gridline-color: #444; }
+            QTableWidget { background-color: transparent; color: #ddd; gridline-color: #444; }
             QHeaderView::section { background-color: #444; color: white; }
         """)
-        ve_layout.addWidget(self.ve_table)
+        ve_card_layout.addWidget(self.ve_table)
 
         # VE Heatmap
         self.ve_heatmap = pg.ImageView()
         self.ve_heatmap.setStyleSheet("background-color: transparent;")
-        ve_layout.addWidget(self.ve_heatmap)
+        ve_card_layout.addWidget(self.ve_heatmap)
+        ve_layout.addWidget(ve_card)
         # Set colormap (viridis-like)
         pos = [0.0, 0.25, 0.5, 0.75, 1.0]
         color = [[68, 1, 84], [68, 50, 124], [40, 120, 142], [102, 183, 120], [237, 248, 33]]
@@ -321,73 +431,186 @@ class MainWindow(QMainWindow):
         ve_layout.addLayout(cyl_layout)
         self.tabs.addTab(ve_tab, "VE Table")
 
-        # Charts Tab with styled plots
+        # Charts Tab with styled plots wrapped in a card
         charts_tab = QWidget()
         charts_layout = QVBoxLayout(charts_tab)
+        charts_layout.setContentsMargins(6,6,6,6)
+
+        charts_card = QFrame()
+        charts_card.setProperty('class', 'card')
+        charts_card_layout = QVBoxLayout(charts_card)
+        try:
+            c_sh = QGraphicsDropShadowEffect()
+            c_sh.setBlurRadius(12)
+            c_sh.setOffset(0, 3)
+            c_sh.setColor(QColor(0,0,0,160))
+            charts_card.setGraphicsEffect(c_sh)
+        except Exception:
+            pass
+        charts_card_layout.setContentsMargins(8,8,8,8)
+
+        # Small toolbar with icons
+        toolbar_layout = QHBoxLayout()
+        refresh_icon = QIcon(QPixmap(16,16))
+        pix = QPixmap(16,16)
+        pix.fill(QColor('#2a7bd6'))
+        refresh_icon = QIcon(pix)
+        save_pix = QPixmap(16,16)
+        save_pix.fill(QColor('#ffd24a'))
+        save_icon = QIcon(save_pix)
+
+        refresh_btn = QPushButton()
+        refresh_btn.setIcon(refresh_icon)
+        refresh_btn.setToolTip("Refresh chart")
+        refresh_btn.setFixedSize(28,28)
+        refresh_btn.setStyleSheet("border:none; background: transparent;")
+        refresh_btn.clicked.connect(lambda: self.update_chart())
+
+        save_btn = QPushButton()
+        save_btn.setIcon(save_icon)
+        save_btn.setToolTip("Save chart image")
+        save_btn.setFixedSize(28,28)
+        save_btn.setStyleSheet("border:none; background: transparent;")
+        save_btn.clicked.connect(lambda: self.plot_widget.export()) if hasattr(pg.PlotWidget, 'export') else save_btn.clicked.connect(lambda: None)
+
+        toolbar_layout.addWidget(refresh_btn)
+        toolbar_layout.addWidget(save_btn)
+        toolbar_layout.addStretch()
+        charts_card_layout.addLayout(toolbar_layout)
+
+        # Sensor selector
+        selector_layout = QHBoxLayout()
         self.sensor_dropdown = QComboBox()
-        self.sensor_dropdown.setStyleSheet("background: #444; color: #ddd; border: 1px solid #555; border-radius: 4px;")
-        charts_layout.addWidget(self.sensor_dropdown)
+        self.sensor_dropdown.setStyleSheet("background: #444; color: #ddd; border: 1px solid #555; border-radius: 4px; padding:4px;")
+        selector_layout.addWidget(QLabel("Sensor:"))
+        selector_layout.addWidget(self.sensor_dropdown)
+        selector_layout.addStretch()
+        charts_card_layout.addLayout(selector_layout)
 
+        # Main plot
         self.plot_widget = pg.PlotWidget(title="Time Series")
-        self.plot_widget.setBackground('#333')
-        self.plot_curve = self.plot_widget.plot(pen=pg.mkPen('y', width=2))
-        charts_layout.addWidget(self.plot_widget)
+        self.plot_widget.setBackground('transparent')
+        self.plot_curve = self.plot_widget.plot(pen=pg.mkPen('#ffd24a', width=2))
+        charts_card_layout.addWidget(self.plot_widget)
 
+        # Histogram
         self.hist_widget = pg.PlotWidget(title="Histogram")
-        self.hist_widget.setBackground('#333')
-        self.hist_curve = self.hist_widget.plot(stepMode=True, fillLevel=0, brush=(0,0,255,150))
-        charts_layout.addWidget(self.hist_widget)
+        self.hist_widget.setBackground('transparent')
+        self.hist_curve = self.hist_widget.plot(stepMode=True, fillLevel=0, brush=(0,200,170,120))
+        charts_card_layout.addWidget(self.hist_widget)
 
+        charts_card.setMinimumHeight(360)
+        charts_layout.addWidget(charts_card)
         self.sensor_dropdown.currentIndexChanged.connect(self.update_chart)
         self.tabs.addTab(charts_tab, "Charts")
 
         # Log Timing Tab with styled table
         log_timing_tab = QWidget()
         log_timing_layout = QVBoxLayout(log_timing_tab)
-        
+        # Wrap controls and table in a card
+        log_card = QFrame()
+        log_card.setProperty('class', 'card')
+        log_card_layout = QVBoxLayout(log_card)
+        try:
+            l_sh = QGraphicsDropShadowEffect()
+            l_sh.setBlurRadius(10)
+            l_sh.setOffset(0, 2)
+            l_sh.setColor(QColor(0,0,0,150))
+            log_card.setGraphicsEffect(l_sh)
+        except Exception:
+            pass
+
         # Control buttons with modern style
         controls_layout = QHBoxLayout()
+        # small icons for clear/export
+        pix_clear = QPixmap(14,14)
+        pix_clear.fill(QColor('#9aa0a6'))
+        pix_export = QPixmap(14,14)
+        pix_export.fill(QColor('#3ac3c3'))
+
         self.clear_log_button = QPushButton("Clear Log")
+        self.clear_log_button.setIcon(QIcon(pix_clear))
+        self.clear_log_button.setIconSize(QSize(14,14))
         self.clear_log_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #555, stop:1 #444); color: white; border: 1px solid #666; border-radius: 4px;")
         self.clear_log_button.clicked.connect(self.clear_log_timing)
+
         self.export_log_button = QPushButton("Export to CSV")
+        self.export_log_button.setIcon(QIcon(pix_export))
+        self.export_log_button.setIconSize(QSize(14,14))
         self.export_log_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #555, stop:1 #444); color: white; border: 1px solid #666; border-radius: 4px;")
         self.export_log_button.clicked.connect(self.export_log_timing)
+
         controls_layout.addWidget(self.clear_log_button)
         controls_layout.addWidget(self.export_log_button)
         controls_layout.addStretch()
-        log_timing_layout.addLayout(controls_layout)
-        
+        log_card_layout.addLayout(controls_layout)
+
         # Table for log entries - one row per timestamp with all sensors
         self.log_timing_table = QTableWidget()
         self.log_timing_table.setColumnCount(1)
         self.log_timing_table.setHorizontalHeaderLabels(["Timestamp | All Sensors"])
         self.log_timing_table.horizontalHeader().setStretchLastSection(True)
         self.log_timing_table.setStyleSheet("""
-            QTableWidget { background-color: #333; color: #ddd; gridline-color: #444; }
+            QTableWidget { background-color: transparent; color: #ddd; gridline-color: #444; }
             QHeaderView::section { background-color: #444; color: white; }
         """)
-        log_timing_layout.addWidget(self.log_timing_table)
-        
+        log_card_layout.addWidget(self.log_timing_table)
+
         # Dictionary to store the latest timestamp and sensor readings
         self.current_log_entry_time = None
         self.current_log_sensors = {}
-        
+
+        log_timing_layout.addWidget(log_card)
         self.tabs.addTab(log_timing_tab, "Log Timing")
 
         # Logging Tab
+        # Logging Tab wrapped in a card with icon
         logging_tab = QWidget()
         logging_layout = QVBoxLayout(logging_tab)
+        logging_layout.setContentsMargins(6,6,6,6)
+
+        logging_card = QFrame()
+        logging_card.setProperty('class', 'card')
+        logging_card_layout = QHBoxLayout(logging_card)
+        try:
+            lg_sh = QGraphicsDropShadowEffect()
+            lg_sh.setBlurRadius(8)
+            lg_sh.setOffset(0, 2)
+            lg_sh.setColor(QColor(0,0,0,140))
+            logging_card.setGraphicsEffect(lg_sh)
+        except Exception:
+            pass
+        logging_card_layout.setContentsMargins(8,8,8,8)
+
+        # Small icon for logging
+        log_pix = QPixmap(18,18)
+        log_pix.fill(QColor('#ff6b6b'))
+        log_icon = QIcon(log_pix)
+
         self.log_button = QPushButton("Start Logging")
-        self.log_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #555, stop:1 #444); color: white; border: 1px solid #666; border-radius: 4px;")
+        self.log_button.setIcon(log_icon)
+        self.log_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a7bd6, stop:1 #1a5aa8); color: white; border: none; border-radius: 6px; padding: 8px 12px;")
+        self.log_button.setFixedHeight(36)
         self.log_button.clicked.connect(self.toggle_logging)
-        logging_layout.addWidget(self.log_button)
+
+        logging_card_layout.addWidget(self.log_button)
+        logging_card_layout.addStretch()
+        logging_layout.addWidget(logging_card)
         self.tabs.addTab(logging_tab, "Logging")
 
     def create_connection_panel(self):
         """Create the connection control panel with modern buttons"""
-        panel = QWidget()
+        panel = QFrame()
+        panel.setProperty('class', 'card')
         layout = QHBoxLayout(panel)
+        try:
+            p_sh = QGraphicsDropShadowEffect()
+            p_sh.setBlurRadius(8)
+            p_sh.setOffset(0, 2)
+            p_sh.setColor(QColor(0,0,0,140))
+            panel.setGraphicsEffect(p_sh)
+        except Exception:
+            pass
         
         device_label = QLabel("Device:")
         device_label.setStyleSheet("color: #ddd;")
@@ -397,31 +620,218 @@ class MainWindow(QMainWindow):
         self.device_dropdown.addItem("(Scan for devices...)")
         layout.addWidget(self.device_dropdown)
         
+        # Create small colored icons for connection controls
+        pix_scan = QPixmap(16,16)
+        pix_scan.fill(QColor('#6bbf59'))
+        pix_connect = QPixmap(16,16)
+        pix_connect.fill(QColor('#2a7bd6'))
+        pix_test = QPixmap(16,16)
+        pix_test.fill(QColor('#ffd24a'))
+        pix_disconnect = QPixmap(16,16)
+        pix_disconnect.fill(QColor('#ff6b6b'))
+
         self.scan_button = QPushButton("Scan Devices")
         self.scan_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #555, stop:1 #444); color: white; border: 1px solid #666; border-radius: 4px;")
+        self.scan_button.setIcon(QIcon(pix_scan))
+        self.scan_button.setIconSize(QSize(16,16))
         self.scan_button.clicked.connect(self.scan_devices)
         layout.addWidget(self.scan_button)
         
         self.connect_button = QPushButton("Connect")
         self.connect_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #555, stop:1 #444); color: white; border: 1px solid #666; border-radius: 4px;")
+        self.connect_button.setIcon(QIcon(pix_connect))
+        self.connect_button.setIconSize(QSize(16,16))
         self.connect_button.clicked.connect(self.on_connect_clicked)
         layout.addWidget(self.connect_button)
 
         # Test device button to run quick diagnostics without connecting the UI fully
         self.test_button = QPushButton("Test Device")
         self.test_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #555, stop:1 #444); color: white; border: 1px solid #666; border-radius: 4px;")
+        self.test_button.setIcon(QIcon(pix_test))
+        self.test_button.setIconSize(QSize(16,16))
         self.test_button.clicked.connect(self.on_test_clicked)
         layout.addWidget(self.test_button)
         
         self.disconnect_button = QPushButton("Disconnect")
         self.disconnect_button.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #555, stop:1 #444); color: white; border: 1px solid #666; border-radius: 4px;")
+        self.disconnect_button.setIcon(QIcon(pix_disconnect))
+        self.disconnect_button.setIconSize(QSize(16,16))
         self.disconnect_button.clicked.connect(self.on_disconnect_clicked)
         self.disconnect_button.setEnabled(False)
         layout.addWidget(self.disconnect_button)
         
         layout.addStretch()
         
+        # Style the status bar to match theme
+        try:
+            self.status_bar.setStyleSheet("background: #0f0f10; color: #ddd; padding: 4px 8px;")
+        except Exception:
+            pass
+
         return panel
+
+    def create_dashboard_textured_background(self, size=(1200, 800), pattern_intensity=0.15):
+        """Generate a subtle carbon-fiber/noise textured background for the dashboard."""
+        image = QImage(size[0], size[1], QImage.Format.Format_RGB32)
+        
+        # Base dark color
+        base_color = QColor(15, 15, 16)
+        image.fill(base_color)
+        
+        # Add subtle noise/texture pattern using numpy
+        import numpy as np
+        pixels = np.random.randint(0, int(255 * pattern_intensity), size=(size[1], size[0]), dtype=np.uint8)
+        
+        # Apply noise to image
+        for y in range(size[1]):
+            for x in range(size[0]):
+                noise_val = pixels[y, x]
+                new_color = QColor(
+                    max(0, base_color.red() + noise_val),
+                    max(0, base_color.green() + noise_val),
+                    max(0, base_color.blue() + noise_val)
+                )
+                image.setPixelColor(x, y, new_color)
+        
+        return QPixmap.fromImage(image)
+
+    def show_fab_menu(self):
+        """Show a context menu with quick actions when FAB button is clicked."""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1b1b1e;
+                color: #ddd;
+                border: 1px solid #2b2b2f;
+                border-radius: 6px;
+            }
+            QMenu::item:selected {
+                background-color: #2a7bd6;
+            }
+        """)
+        
+        # Connection status action
+        status_text = "🟢 Connected" if self.connection and self.connection.is_connected() else "🔴 Disconnected"
+        connection_action = QAction(f"Connection: {status_text}", self)
+        connection_action.triggered.connect(self.show_connection_status)
+        menu.addAction(connection_action)
+        
+        menu.addSeparator()
+        
+        # Quick disconnect action
+        if self.connection and self.connection.is_connected():
+            disconnect_action = QAction("Disconnect OBD", self)
+            disconnect_action.triggered.connect(self.on_disconnect_clicked)
+            menu.addAction(disconnect_action)
+        
+        # Clear logs action
+        clear_logs_action = QAction("Clear All Logs", self)
+        clear_logs_action.triggered.connect(self.clear_all_logs)
+        menu.addAction(clear_logs_action)
+        
+        menu.addSeparator()
+        
+        # Export data action
+        export_action = QAction("Export Current Data", self)
+        export_action.triggered.connect(self.export_current_data)
+        menu.addAction(export_action)
+        
+        # Reset VE table action
+        reset_ve_action = QAction("Reset VE Table", self)
+        reset_ve_action.triggered.connect(self.reset_ve_table)
+        menu.addAction(reset_ve_action)
+        
+        # Show menu at button position
+        button_global_pos = self.fab_button.mapToGlobal(self.fab_button.rect().topLeft())
+        menu.exec(button_global_pos - QPoint(menu.sizeHint().width(), menu.sizeHint().height() + 10))
+
+    def show_connection_status(self):
+        """Display detailed connection status information."""
+        if self.connection and self.connection.is_connected():
+            msg = f"""
+Connected to OBD Device
+
+Protocol: {self.connection.protocol_id()}
+Status: {self.connection.status()}
+Port: {self.obd_port if hasattr(self, 'obd_port') else 'Unknown'}
+
+Last Update: Active
+            """
+        else:
+            msg = """
+OBD Device Status
+
+Status: Disconnected
+Port: None
+Last Update: Never connected
+            """
+        QMessageBox.information(self, "Connection Status", msg.strip())
+
+    def clear_all_logs(self):
+        """Clear all log data and reset tables."""
+        reply = QMessageBox.question(
+            self, 
+            "Clear Logs", 
+            "Are you sure you want to clear all logged data?\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.sensor_data.clear()
+            self.log_times.clear()
+            self.status_bar.showMessage("All logs cleared")
+            logger.info("All logs cleared by user")
+
+    def export_current_data(self):
+        """Export current sensor readings to a CSV file."""
+        if not self.sensor_data:
+            QMessageBox.warning(self, "No Data", "No sensor data available to export")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Data",
+            "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    # Write headers
+                    headers = list(self.sensor_data[0].keys()) if self.sensor_data else []
+                    writer.writerow(headers)
+                    # Write data
+                    for sensor_dict in self.sensor_data:
+                        writer.writerow(sensor_dict.values())
+                
+                self.status_bar.showMessage(f"Data exported to {file_path}")
+                QMessageBox.information(self, "Export Success", f"Data exported successfully to:\n{file_path}")
+                logger.info(f"Data exported to {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export data:\n{str(e)}")
+                logger.error(f"Export failed: {e}")
+
+    def reset_ve_table(self):
+        """Reset VE table to default values."""
+        reply = QMessageBox.question(
+            self,
+            "Reset VE Table",
+            "Reset VE table to default values (100.0)?\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            # Reset to default VE value
+            default_ve = 100.0
+            for i in range(len(self.rpm_bins)):
+                for j in range(len(self.map_bins)):
+                    self.ve_table[i][j] = default_ve
+            
+            self.status_bar.showMessage("VE table reset to defaults")
+            logger.info("VE table reset to defaults")
+            # Refresh VE display
+            if hasattr(self, 've_heatmap'):
+                self.update_ve_heatmap()
 
     def scan_devices(self):
         """Scan for available serial/OBD devices using pyserial"""
@@ -665,10 +1075,21 @@ class MainWindow(QMainWindow):
             oil_pressure = self.sensor_values.get('OIL_PRESSURE', 0)
             gear_position = self.sensor_values.get('GEAR_POSITION', '--')
 
+            # Update big RPM gauge
             self.rpm_label.setText(f"RPM: {rpm}")
             self.rpm_gauge.set_value(rpm)
+            
+            # Update compact gauges
             self.speed_label.setText(f"Speed: {speed} km/h")
             self.speed_gauge.set_value(speed)
+            self.iat_gauge2.set_value(iat)
+            self.coolant_gauge2.set_value(coolant)
+            self.throttle_gauge2.set_value(throttle)
+            self.map_gauge2.set_value(map_)
+            self.load_gauge2.set_value(0)  # Placeholder - query actual LOAD value
+            self.o2_b1s1_gauge.set_value(0)  # O2 sensors are typically 0-1V, normalize to 0-1
+            
+            # Update text labels
             self.map_label.setText(f"MAP: {map_} kPa")
             self.maf_label.setText(f"MAF: {maf} g/s")
             self.iat_label.setText(f"IAT: {iat} °C")
@@ -866,6 +1287,10 @@ if __name__ == "__main__":
     
     # Apply polished dark theme
     app.setStyle("Fusion")
+    try:
+        app.setStyleSheet(THEME_QSS)
+    except Exception:
+        pass
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor(35, 35, 35))
     palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
